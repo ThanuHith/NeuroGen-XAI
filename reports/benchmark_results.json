@@ -1,0 +1,108 @@
+{
+  "bbbp": {
+    "RandomForest": {
+      "val": {
+        "roc_auc": 0.8768018773047268,
+        "pr_auc": 0.9640510038867269,
+        "f1": 0.8767123287671232,
+        "mcc": 0.5416027322437376,
+        "balanced_accuracy": 0.815538048944016,
+        "threshold": 0.6800000000000002
+      },
+      "test": {
+        "roc_auc": 0.8584117032392895,
+        "pr_auc": 0.9803540564305262,
+        "f1": 0.9248554913294798,
+        "mcc": 0.36023608084149755,
+        "balanced_accuracy": 0.687042842215256,
+        "threshold": 0.6800000000000002
+      },
+      "checkpoint": "models\\checkpoints\\rf_bbbp.joblib"
+    },
+    "XGBoost": {
+      "val": {
+        "roc_auc": 0.8843446195105599,
+        "pr_auc": 0.9690451200446097,
+        "f1": 0.8805460750853242,
+        "mcc": 0.5496538077285648,
+        "balanced_accuracy": 0.8187227623198123,
+        "threshold": 0.77
+      },
+      "test": {
+        "roc_auc": 0.7648902821316615,
+        "pr_auc": 0.9640772954249582,
+        "f1": 0.9147727272727273,
+        "mcc": 0.1667556773728806,
+        "balanced_accuracy": 0.5762800417972832,
+        "threshold": 0.77
+      },
+      "checkpoint": "models\\checkpoints\\xgb_bbbp.joblib"
+    },
+    "GINEConv_GNN": {
+      "val": {
+        "roc_auc": 0.8348977539389876,
+        "pr_auc": 0.9504339844841645,
+        "f1": 0.8930817610062893,
+        "mcc": 0.422243818973071,
+        "balanced_accuracy": 0.7022292993630573,
+        "threshold": 0.55
+      },
+      "test": {
+        "roc_auc": 0.8228840125391851,
+        "pr_auc": 0.9725763850036435,
+        "f1": 0.9362880886426593,
+        "mcc": 0.23087111132614657,
+        "balanced_accuracy": 0.5765412748171369,
+        "threshold": 0.55
+      },
+      "checkpoint": "models\\checkpoints\\best_gnn_bbbp.pt"
+    }
+  },
+  "chembl220": {
+    "RandomForest": {
+      "val": {
+        "rmse": 1.0891674571571432,
+        "mae": 0.7944850092653745,
+        "r2": 0.4386611682955166,
+        "spearman_r": 0.6863041238987414
+      },
+      "test": {
+        "rmse": 1.0791633806524414,
+        "mae": 0.8122795407196728,
+        "r2": 0.5014648520748823,
+        "spearman_r": 0.6930217574994151
+      },
+      "checkpoint": "models\\checkpoints\\rf_ache.joblib"
+    },
+    "XGBoost": {
+      "val": {
+        "rmse": 1.0379958754546272,
+        "mae": 0.7588885178086785,
+        "r2": 0.49016807304746013,
+        "spearman_r": 0.730323292711837
+      },
+      "test": {
+        "rmse": 1.0725123847131397,
+        "mae": 0.8092692694381663,
+        "r2": 0.507590963527193,
+        "spearman_r": 0.6880544391356948
+      },
+      "checkpoint": "models\\checkpoints\\xgb_ache.joblib"
+    },
+    "GINEConv_GNN": {
+      "val": {
+        "rmse": 1.117631741285481,
+        "mae": 0.8250965433812023,
+        "r2": 0.4089377429484379,
+        "spearman_r": 0.6783433815582379
+      },
+      "test": {
+        "rmse": 1.1803751608861883,
+        "mae": 0.8762468840730818,
+        "r2": 0.403567217133989,
+        "spearman_r": 0.6451764388945979
+      },
+      "checkpoint": "models\\checkpoints\\best_gnn_ache.pt"
+    }
+  }
+}

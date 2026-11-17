@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Data & Model Artifacts (keep directory markers)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+*.pt
+*.pth
+*.pkl
+*.joblib
+*.npz
+*.onnx
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
