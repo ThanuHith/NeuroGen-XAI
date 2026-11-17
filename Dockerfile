@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create conda environment from environment.yml
-COPY environment.yml /app/environment.yml
+# Create conda environment from conda/environment.yml
+COPY conda/environment.yml /app/environment.yml
 RUN mamba env create -f /app/environment.yml && \
     mamba clean -afy
 

@@ -12,17 +12,28 @@ __pycache__/
 venv/
 env/
 
-# Data & Model Artifacts (keep directory markers)
+# Data & Model Artifacts (keep directory markers + compact Streamlit Cloud assets)
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+!data/processed/dataset_statistics.json
+
 *.pt
 *.pth
 *.pkl
 *.joblib
 *.npz
 *.onnx
+
+!data/processed/bbbp_features.npz
+!data/processed/chembl220_features.npz
+!models/checkpoints/best_gnn_bbbp.pt
+!models/checkpoints/best_gnn_ache.pt
+!models/checkpoints/xgb_bbbp.joblib
+!models/checkpoints/xgb_ache.joblib
+!models/checkpoints/rf_bbbp.joblib
+models/checkpoints/rf_ache.joblib
 
 # Logs & OS
 *.log

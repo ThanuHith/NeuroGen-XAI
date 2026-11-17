@@ -31,7 +31,9 @@ from PIL import Image
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdFingerprintGenerator
 from rdkit.Chem.Draw import SimilarityMaps, rdMolDraw2D
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from torch_geometric.loader import DataLoader
+from xgboost import XGBClassifier, XGBRegressor
 
 from src.data_pipeline.prepare_datasets import (
     DESCRIPTOR_COLUMNS,
@@ -40,6 +42,7 @@ from src.data_pipeline.prepare_datasets import (
     FeatureExtractor,
     MolCleaner,
 )
+from src.models.baseline_rf_xgb import load_scaffold_split_data
 from src.models.gnn_multitask import GINEConfig, NeuroGINEModel, smiles_to_pyg_data
 
 try:
@@ -104,20 +107,24 @@ class NeuroGenExplainer:
     def __init__(
         self,
         checkpoint_dir: Path | str = Path("models/checkpoints"),
+        data_dir: Path | str | None = None,
         device: str | None = None,
     ) -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.data_dir = (
+            Path(data_dir)
+            if data_dir is not None
+            else self.checkpoint_dir.resolve().parent.parent / "data" / "processed"
+        )
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.cleaner = MolCleaner()
         self.extractor = FeatureExtractor(radius=MORGAN_RADIUS, n_bits=MORGAN_NBITS)
 
-        # Load baseline joblib bundles
-        rf_bbbp_bundle = self._load_joblib("rf_bbbp.joblib")
-        xgb_bbbp_bundle = self._load_joblib("xgb_bbbp.joblib")
-        rf_ache_bundle = self._load_joblib("rf_ache.joblib")
-        xgb_ache_bundle = self._load_joblib("xgb_ache.joblib")
+        # Load or self-heal baseline joblib bundles (handles cloud cold-starts & sklearn version drift)
+        rf_bbbp_bundle, xgb_bbbp_bundle = self._load_or_fit_task_baselines("bbbp")
+        rf_ache_bundle, xgb_ache_bundle = self._load_or_fit_task_baselines("chembl220")
 
         self.rf_bbbp = rf_bbbp_bundle["model"]
         self.xgb_bbbp = xgb_bbbp_bundle["model"]
@@ -127,32 +134,146 @@ class NeuroGenExplainer:
         self.xgb_ache = xgb_ache_bundle["model"]
         self.ache_scaler = rf_ache_bundle["scaler"]
 
-        # Load PyTorch Geometric GINEConv models
+        # Load PyTorch Geometric GINEConv models (with graceful fallback if missing)
         self.gnn_bbbp, self.gnn_bbbp_mean, self.gnn_bbbp_scale = self._load_gnn("best_gnn_bbbp.pt")
         self.gnn_ache, self.gnn_ache_mean, self.gnn_ache_scale = self._load_gnn("best_gnn_ache.pt")
 
         # Initialize TreeExplainer when `shap` package is available
-        self._shap_xgb_bbbp = shap.TreeExplainer(self.xgb_bbbp) if shap is not None else None
-        self._shap_xgb_ache = shap.TreeExplainer(self.xgb_ache) if shap is not None else None
+        self._shap_xgb_bbbp = self._init_tree_explainer(self.xgb_bbbp)
+        self._shap_xgb_ache = self._init_tree_explainer(self.xgb_ache)
 
-    def _load_joblib(self, filename: str) -> dict[str, Any]:
+    @staticmethod
+    def _init_tree_explainer(model: Any) -> Any | None:
+        if shap is None:
+            return None
+        try:
+            return shap.TreeExplainer(model)
+        except Exception as exc:
+            LOGGER.warning("Falling back to XGBoost pred_contribs TreeSHAP: %s", exc)
+            return None
+
+    def _try_load_joblib(self, filename: str) -> dict[str, Any] | None:
         path = self.checkpoint_dir / filename
         if not path.exists():
-            raise FileNotFoundError(f"Required baseline checkpoint missing: {path}")
-        return joblib.load(path)
+            return None
+        try:
+            return joblib.load(path)
+        except Exception as exc:
+            LOGGER.warning("Could not unpickle %s (%s); will refit from NPZ.", path, exc)
+            return None
 
-    def _load_gnn(self, filename: str) -> tuple[NeuroGINEModel, np.ndarray, np.ndarray]:
+    def _load_or_fit_task_baselines(self, task: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Load RF/XGB checkpoints or refit quickly from Phase 1 NPZ archives if absent/incompatible."""
+        if task == "bbbp":
+            rf_file, xgb_file, npz_file = "rf_bbbp.joblib", "xgb_bbbp.joblib", "bbbp_features.npz"
+        else:
+            rf_file, xgb_file, npz_file = "rf_ache.joblib", "xgb_ache.joblib", "chembl220_features.npz"
+
+        rf_bundle = self._try_load_joblib(rf_file)
+        xgb_bundle = self._try_load_joblib(xgb_file)
+        if rf_bundle is not None and xgb_bundle is not None:
+            return rf_bundle, xgb_bundle
+
+        npz_path = self.data_dir / npz_file
+        if not npz_path.exists():
+            npz_path = Path("data/processed") / npz_file
+        if not npz_path.exists():
+            raise FileNotFoundError(
+                f"Missing checkpoint(s) for {task} and fallback feature archive not found at {npz_path}"
+            )
+
+        ds = load_scaffold_split_data(npz_path, dataset_name=task)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        if rf_bundle is None:
+            LOGGER.info("Fitting fast fallback RandomForest (%s) from %s...", task, npz_path)
+            if task == "bbbp":
+                rf_model = RandomForestClassifier(
+                    n_estimators=200,
+                    max_depth=12,
+                    min_samples_leaf=2,
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            else:
+                rf_model = RandomForestRegressor(
+                    n_estimators=200,
+                    max_depth=12,
+                    min_samples_leaf=2,
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            rf_model.fit(ds.X_train, ds.y_train)
+            rf_bundle = {
+                "model": rf_model,
+                "scaler": ds.scaler,
+                "descriptor_names": ds.descriptor_names,
+            }
+            try:
+                joblib.dump(rf_bundle, self.checkpoint_dir / rf_file, compress=3)
+            except Exception as exc:
+                LOGGER.warning("Could not cache %s: %s", rf_file, exc)
+
+        if xgb_bundle is None:
+            LOGGER.info("Fitting fast fallback XGBoost (%s) from %s...", task, npz_path)
+            if task == "bbbp":
+                n_pos = int((ds.y_train == 1).sum())
+                n_neg = int((ds.y_train == 0).sum())
+                xgb_model = XGBClassifier(
+                    n_estimators=300,
+                    max_depth=6,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    scale_pos_weight=float(n_neg / max(n_pos, 1)),
+                    eval_metric="aucpr",
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            else:
+                xgb_model = XGBRegressor(
+                    n_estimators=300,
+                    max_depth=6,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    eval_metric="rmse",
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            xgb_model.fit(ds.X_train, ds.y_train)
+            xgb_bundle = {
+                "model": xgb_model,
+                "scaler": ds.scaler,
+                "descriptor_names": ds.descriptor_names,
+            }
+            try:
+                joblib.dump(xgb_bundle, self.checkpoint_dir / xgb_file, compress=3)
+            except Exception as exc:
+                LOGGER.warning("Could not cache %s: %s", xgb_file, exc)
+
+        return rf_bundle, xgb_bundle
+
+    def _load_gnn(
+        self, filename: str
+    ) -> tuple[NeuroGINEModel | None, np.ndarray | None, np.ndarray | None]:
         path = self.checkpoint_dir / filename
         if not path.exists():
-            raise FileNotFoundError(f"Required GNN checkpoint missing: {path}")
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        cfg = GINEConfig(**ckpt["config"])
-        model = NeuroGINEModel(cfg).to(self.device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
-        mean = np.asarray(ckpt["desc_scaler_mean"], dtype=np.float32)
-        scale = np.asarray(ckpt["desc_scaler_scale"], dtype=np.float32)
-        return model, mean, scale
+            LOGGER.warning("GNN checkpoint missing (%s); falling back to RF+XGB ensemble.", path)
+            return None, None, None
+        try:
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            cfg = GINEConfig(**ckpt["config"])
+            model = NeuroGINEModel(cfg).to(self.device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
+            mean = np.asarray(ckpt["desc_scaler_mean"], dtype=np.float32)
+            scale = np.asarray(ckpt["desc_scaler_scale"], dtype=np.float32)
+            return model, mean, scale
+        except Exception as exc:
+            LOGGER.warning("Failed to load GNN checkpoint %s (%s); using RF+XGB fallback.", path, exc)
+            return None, None, None
 
     def _prepare_mol_and_features(
         self, smiles: str
@@ -226,26 +347,31 @@ class NeuroGenExplainer:
         pic50_rf = self.rf_ache.predict(X_ache)
         pic50_xgb = self.xgb_ache.predict(X_ache)
 
-        desc_gnn_bbbp = (descs - self.gnn_bbbp_mean) / np.where(
-            self.gnn_bbbp_scale == 0, 1.0, self.gnn_bbbp_scale
-        )
-        desc_gnn_ache = (descs - self.gnn_ache_mean) / np.where(
-            self.gnn_ache_scale == 0, 1.0, self.gnn_ache_scale
-        )
+        bbb_gnn = None
+        if self.gnn_bbbp is not None and self.gnn_bbbp_mean is not None and self.gnn_bbbp_scale is not None:
+            desc_gnn_bbbp = (descs - self.gnn_bbbp_mean) / np.where(
+                self.gnn_bbbp_scale == 0, 1.0, self.gnn_bbbp_scale
+            )
+            graphs_bbbp = [
+                smiles_to_pyg_data(item[1], descriptors=d) for item, d in zip(parsed, desc_gnn_bbbp)
+            ]
+            bbb_gnn = self._batched_gnn_forward(self.gnn_bbbp, graphs_bbbp, apply_sigmoid=True)
 
-        graphs_bbbp = [
-            smiles_to_pyg_data(item[1], descriptors=d) for item, d in zip(parsed, desc_gnn_bbbp)
-        ]
-        graphs_ache = [
-            smiles_to_pyg_data(item[1], descriptors=d) for item, d in zip(parsed, desc_gnn_ache)
-        ]
-
-        bbb_gnn = self._batched_gnn_forward(self.gnn_bbbp, graphs_bbbp, apply_sigmoid=True)
-        pic50_gnn = self._batched_gnn_forward(self.gnn_ache, graphs_ache, apply_sigmoid=False)
+        pic50_gnn = None
+        if self.gnn_ache is not None and self.gnn_ache_mean is not None and self.gnn_ache_scale is not None:
+            desc_gnn_ache = (descs - self.gnn_ache_mean) / np.where(
+                self.gnn_ache_scale == 0, 1.0, self.gnn_ache_scale
+            )
+            graphs_ache = [
+                smiles_to_pyg_data(item[1], descriptors=d) for item, d in zip(parsed, desc_gnn_ache)
+            ]
+            pic50_gnn = self._batched_gnn_forward(self.gnn_ache, graphs_ache, apply_sigmoid=False)
 
         for i, (orig_idx, canon, _, _, _, desc_dict) in enumerate(parsed):
-            bbb_ens = float(np.mean([bbb_rf[i], bbb_xgb[i], bbb_gnn[i]]))
-            pic50_ens = float(np.mean([pic50_rf[i], pic50_xgb[i], pic50_gnn[i]]))
+            bbb_components = [bbb_rf[i], bbb_xgb[i]] + ([bbb_gnn[i]] if bbb_gnn is not None else [])
+            pic50_components = [pic50_rf[i], pic50_xgb[i]] + ([pic50_gnn[i]] if pic50_gnn is not None else [])
+            bbb_ens = float(np.mean(bbb_components))
+            pic50_ens = float(np.mean(pic50_components))
             ic50_nm = float(10.0 ** (9.0 - pic50_ens))
             violations, lipinski_pass = _compute_lipinski_status(desc_dict)
 
@@ -255,11 +381,11 @@ class NeuroGenExplainer:
                 "canonical_smiles": canon,
                 "bbb_prob_rf": float(bbb_rf[i]),
                 "bbb_prob_xgb": float(bbb_xgb[i]),
-                "bbb_prob_gnn": float(bbb_gnn[i]),
+                "bbb_prob_gnn": float(bbb_gnn[i]) if bbb_gnn is not None else float("nan"),
                 "bbb_prob_ensemble": bbb_ens,
                 "pic50_rf": float(pic50_rf[i]),
                 "pic50_xgb": float(pic50_xgb[i]),
-                "pic50_gnn": float(pic50_gnn[i]),
+                "pic50_gnn": float(pic50_gnn[i]) if pic50_gnn is not None else float("nan"),
                 "pic50_ensemble": pic50_ens,
                 "ic50_nm": ic50_nm,
                 "descriptors": desc_dict,
@@ -519,26 +645,33 @@ class NeuroGenExplainer:
         }
 
         # Method B: GINEConv Input*Gradient + Atom Occlusion Saliency
-        desc_gnn_bbbp = (desc_vec[0] - self.gnn_bbbp_mean) / np.where(
-            self.gnn_bbbp_scale == 0, 1.0, self.gnn_bbbp_scale
-        )
-        desc_gnn_ache = (desc_vec[0] - self.gnn_ache_mean) / np.where(
-            self.gnn_ache_scale == 0, 1.0, self.gnn_ache_scale
-        )
-        gnn_atoms_bbb = self._compute_gnn_atom_attribution(
-            self.gnn_bbbp, canon_smiles, desc_gnn_bbbp, apply_sigmoid=True
-        )
-        gnn_atoms_ache = self._compute_gnn_atom_attribution(
-            self.gnn_ache, canon_smiles, desc_gnn_ache, apply_sigmoid=False
-        )
+        if self.gnn_bbbp is not None and self.gnn_bbbp_mean is not None and self.gnn_bbbp_scale is not None:
+            desc_gnn_bbbp = (desc_vec[0] - self.gnn_bbbp_mean) / np.where(
+                self.gnn_bbbp_scale == 0, 1.0, self.gnn_bbbp_scale
+            )
+            gnn_atoms_bbb = self._compute_gnn_atom_attribution(
+                self.gnn_bbbp, canon_smiles, desc_gnn_bbbp, apply_sigmoid=True
+            )
+            fused_bbb = _normalize_signed(
+                0.5 * _normalize_signed(shap_atoms_bbb) + 0.5 * _normalize_signed(gnn_atoms_bbb)
+            ).tolist()
+        else:
+            gnn_atoms_bbb = np.zeros(mol.GetNumAtoms(), dtype=np.float64)
+            fused_bbb = _normalize_signed(shap_atoms_bbb).tolist()
 
-        # Fuse TreeSHAP and GNN attributions in [-1, +1]
-        fused_bbb = _normalize_signed(
-            0.5 * _normalize_signed(shap_atoms_bbb) + 0.5 * _normalize_signed(gnn_atoms_bbb)
-        ).tolist()
-        fused_ache = _normalize_signed(
-            0.5 * _normalize_signed(shap_atoms_ache) + 0.5 * _normalize_signed(gnn_atoms_ache)
-        ).tolist()
+        if self.gnn_ache is not None and self.gnn_ache_mean is not None and self.gnn_ache_scale is not None:
+            desc_gnn_ache = (desc_vec[0] - self.gnn_ache_mean) / np.where(
+                self.gnn_ache_scale == 0, 1.0, self.gnn_ache_scale
+            )
+            gnn_atoms_ache = self._compute_gnn_atom_attribution(
+                self.gnn_ache, canon_smiles, desc_gnn_ache, apply_sigmoid=False
+            )
+            fused_ache = _normalize_signed(
+                0.5 * _normalize_signed(shap_atoms_ache) + 0.5 * _normalize_signed(gnn_atoms_ache)
+            ).tolist()
+        else:
+            gnn_atoms_ache = np.zeros(mol.GetNumAtoms(), dtype=np.float64)
+            fused_ache = _normalize_signed(shap_atoms_ache).tolist()
 
         png_bbb = self.render_atom_heatmap_png(canon_smiles, fused_bbb, width=width, height=height)
         png_ache = self.render_atom_heatmap_png(canon_smiles, fused_ache, width=width, height=height)
